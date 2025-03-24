@@ -1,0 +1,19 @@
+# Visual Studio stuff
+.vs/
+*.user
+*.suo
+
+# Build results
+bin/
+obj/
+
+# NuGet Packages
+*.nupkg
+packages/
+
+# Visual Studio Code
+.vscode/
+
+# Other
+*.log
+*.vsidx
