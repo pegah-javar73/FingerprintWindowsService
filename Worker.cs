@@ -1,273 +1,266 @@
 ﻿
 using System;
+using System.Drawing;
+using System.IO;
 using System.Net;
+using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
+using DentalWindowsApp;
 using Microsoft.Extensions.Hosting;
-using Microsoft.Extensions.Logging;
-using System.Drawing;
-using System.Drawing.Imaging;
-using System.IO;
+using Newtonsoft.Json;
 using Suprema;
-using System.Text.Json;
 
 namespace FingerprintWindowsService
 {
     public class Worker : BackgroundService
     {
-        private readonly ILogger<Worker> _logger;
-        private HttpListener _listener;
         private UFScannerManager scannerManager;
         private UFScanner scanner;
-        private byte[] lastCapturedTemplate;
-        private int lastTemplateSize;
+        private UFMatcher matcher;
+        private byte[] storedTemplate;
 
-        public Worker(ILogger<Worker> logger)
+        public Worker()
         {
-            _logger = logger;
+            try
+            {
+                DllLoader.LoadSupremaDlls();
+                Log("✅ DLL ها بارگذاری شدند.");
+            }
+            catch (Exception ex)
+            {
+                Log("❌ خطا در بارگذاری DLL: " + ex.Message);
+            }
+
+            scannerManager = new UFScannerManager(null);
+            scannerManager.Init();
+
+            if (scannerManager.Scanners.Count > 0)
+            {
+                scanner = scannerManager.Scanners[0];
+                matcher = new UFMatcher();
+                Log("📷 اسکنر آماده است.");
+            }
+            else
+            {
+                Log("❌ اسکنری یافت نشد.");
+            }
         }
 
         protected override async Task ExecuteAsync(CancellationToken stoppingToken)
         {
-            InitializeScanner();
+            var httpListener = new HttpListener();
+            httpListener.Prefixes.Add("http://localhost:6001/");
 
-            _listener = new HttpListener();
-            _listener.Prefixes.Add("http://localhost:6001/");
-            _listener.Start();
-            _logger.LogInformation("✅ HTTP Listener started on http://localhost:6001/");
+            httpListener.Start();
+            Log("🌐 Listening on http://localhost:6001/");
 
             while (!stoppingToken.IsCancellationRequested)
             {
                 try
                 {
-                    var context = await _listener.GetContextAsync();
-                    _ = Task.Run(() => ProcessRequest(context));
+                    var context = await httpListener.GetContextAsync();
+                    var request = context.Request;
+                    var response = context.Response;
+
+                    // هدرهای CORS
+                    response.Headers.Add("Access-Control-Allow-Origin", "*");
+                    response.Headers.Add("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+                    response.Headers.Add("Access-Control-Allow-Headers", "Content-Type");
+
+                    // پاسخ به درخواست OPTIONS
+                    if (request.HttpMethod == "OPTIONS")
+                    {
+                        response.StatusCode = (int)HttpStatusCode.OK;
+                        response.Close();
+                        continue;
+                    }
+
+                    string resultJson = string.Empty;
+
+                    switch (request.Url.AbsolutePath.ToLower())
+                    {
+                        case "/capture":
+                            resultJson = Capture();
+                            break;
+
+                        case "/match":
+                            resultJson = Match();
+                            break;
+                        case "/matchtemplates":
+                            using (var reader = new StreamReader(request.InputStream, request.ContentEncoding))
+                            {
+                                var body = await reader.ReadToEndAsync();
+                                resultJson = MatchTemplates(body);
+                            }
+                            break;
+
+                        default:
+                            response.StatusCode = (int)HttpStatusCode.NotFound;
+                            resultJson = CreateResponse(false, null, "آدرس یافت نشد.");
+                            break;
+                    }
+
+                    await SendResponse(response, resultJson);
                 }
                 catch (Exception ex)
                 {
-                    _logger.LogError($"⚠️ Listener Exception: {ex.Message}");
+                    Log("❌ خطا در پردازش درخواست: " + ex.Message);
                 }
             }
+
+            httpListener.Stop();
         }
-
-        private void ProcessRequest(HttpListenerContext context)
+        private string Capture()
         {
-            context.Response.AddHeader("Access-Control-Allow-Origin", "*");
-            context.Response.AddHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-            context.Response.AddHeader("Access-Control-Allow-Headers", "Content-Type");
+            if (scanner == null)
+                return CreateResponse(false, null, "اسکنر آماده نیست.");
 
-            if (context.Request.HttpMethod == "OPTIONS")
+            var status = scanner.CaptureSingleImage();
+            if (status == UFS_STATUS.OK)
             {
-                context.Response.StatusCode = 200;
-                context.Response.Close();
-                return;
-            }
-
-            if (context.Request.HttpMethod == "POST" && context.Request.Url.AbsolutePath == "/match")
-            {
-                HandleMatchRequest(context);
-                return;
-            }
-
-            if (context.Request.Url.AbsolutePath != "/capture")
-            {
-                context.Response.StatusCode = 404;
-                context.Response.Close();
-                _logger.LogWarning($"❌ Invalid endpoint requested: {context.Request.Url.AbsolutePath}");
-                return;
-            }
-
-            CaptureFingerprint(context);
-        }
-
-        private void CaptureFingerprint(HttpListenerContext context)
-        {
-            try
-            {
-                if (scanner == null)
+                status = scanner.GetCaptureImageBuffer(out Bitmap bitmap, out int resolution);
+                if (status == UFS_STATUS.OK)
                 {
-                    _logger.LogError("❌ Scanner not initialized.");
-                    context.Response.StatusCode = 500;
-                    context.Response.Close();
-                    return;
-                }
-
-                _logger.LogInformation("👆 لطفاً انگشت خود را روی دستگاه قرار دهید...");
-                var captureStatus = scanner.CaptureSingleImage();
-
-                if (captureStatus != UFS_STATUS.OK)
-                {
-                    _logger.LogError($"❌ CaptureSingleImage failed: {captureStatus}");
-                    context.Response.StatusCode = 500;
-                    context.Response.Close();
-                    return;
-                }
-
-                var imageStatus = scanner.GetCaptureImageBuffer(out Bitmap fingerprintBitmap, out int resolution);
-                if (imageStatus == UFS_STATUS.OK)
-                {
-                    lastCapturedTemplate = new byte[512];
-                    var extractStatus = scanner.Extract(lastCapturedTemplate, out lastTemplateSize, out int quality);
-
-                    if (extractStatus != UFS_STATUS.OK)
+                    byte[] template = GetFingerprintTemplate();
+                    if (template != null)
                     {
-                        _logger.LogError($"❌ Extract failed with status: {extractStatus}");
-                        context.Response.StatusCode = 500;
-                        context.Response.Close();
-                        return;
-                    }
-
-                    using (var ms = new MemoryStream())
-                    {
-                        fingerprintBitmap.Save(ms, ImageFormat.Png);
-                        string base64Image = Convert.ToBase64String(ms.ToArray());
-                        byte[] responseBytes = System.Text.Encoding.UTF8.GetBytes(base64Image);
-
-                        context.Response.ContentType = "text/plain";
-                        context.Response.ContentLength64 = responseBytes.Length;
-                        context.Response.OutputStream.Write(responseBytes, 0, responseBytes.Length);
-                        context.Response.OutputStream.Close();
-
-                        _logger.LogInformation("✅ اثر انگشت دریافت و template ذخیره شد.");
+                        storedTemplate = template;
+                        // ❗ برگرداندن مستقیم byte[] به عنوان data (نه base64)
+                        return CreateResponse(true, template, "اثر انگشت ثبت شد.");
                     }
                 }
-                else
+            }
+
+            return CreateResponse(false, null, "خطا در ثبت اثر انگشت.");
+        }
+
+        private string Match()
+        {
+            if (scanner == null || storedTemplate == null)
+                return CreateResponse(false, null, "ابتدا اثر انگشت را ذخیره کنید.");
+
+            var status = scanner.CaptureSingleImage();
+            if (status == UFS_STATUS.OK)
+            {
+                status = scanner.GetCaptureImageBuffer(out Bitmap bitmap, out int resolution);
+                if (status == UFS_STATUS.OK)
                 {
-                    _logger.LogError($"❌ Failed to get capture buffer: {imageStatus}");
-                    context.Response.StatusCode = 500;
-                    context.Response.Close();
+                    byte[] newTemplate = GetFingerprintTemplate();
+                    if (newTemplate != null)
+                    {
+                        bool matched;
+                        var verifyStatus = matcher.Verify(
+                            storedTemplate, storedTemplate.Length,
+                            newTemplate, newTemplate.Length,
+                            out matched
+                        );
+
+                        if (verifyStatus == UFM_STATUS.OK)
+                        {
+                            if (matched)
+                                return CreateResponse(true, "Fingerprint matched.", "اثر انگشت مطابقت دارد ✅");
+                            else
+                                return CreateResponse(false, "Fingerprint does not match.", "اثر انگشت مطابقت ندارد ❌");
+                        }
+
+                        return CreateResponse(false, null, "خطا در تطبیق: " + verifyStatus);
+                    }
                 }
             }
-            catch (Exception ex)
-            {
-                _logger.LogError($"❌ Exception in CaptureFingerprint: {ex.Message}");
-                context.Response.StatusCode = 500;
-                context.Response.Close();
-            }
+
+            return CreateResponse(false, null, "خطا در دریافت اثر انگشت.");
         }
-        //--for match 
-        private void HandleMatchRequest(HttpListenerContext context)
+
+        private byte[] GetFingerprintTemplate()
         {
             try
             {
-                context.Response.AddHeader("Access-Control-Allow-Origin", "*");
-                context.Response.AddHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-                context.Response.AddHeader("Access-Control-Allow-Headers", "Content-Type");
+                byte[] buffer = new byte[1024];
+                int size, quality;
 
-                using (var reader = new StreamReader(context.Request.InputStream))
+                var status = scanner.Extract(buffer, out size, out quality);
+
+                if (status == UFS_STATUS.OK)
                 {
-                    var json = reader.ReadToEnd();
-                    var data = JsonSerializer.Deserialize<MatchRequest>(json);
-
-                    var incomingTemplate = Convert.FromBase64String(data.Base64Template);
-
-                    if (scanner == null)
-                    {
-                        _logger.LogError("❌ اسکنر پیدا نشد.");
-                        context.Response.StatusCode = 500;
-                        context.Response.Close();
-                        return;
-                    }
-
-                    _logger.LogInformation("👆 لطفاً انگشت خود را روی دستگاه قرار دهید برای تطابق...");
-
-                    // شروع اسکن
-                    var captureStatus = scanner.CaptureSingleImage();
-                    if (captureStatus != UFS_STATUS.OK)
-                    {
-                        _logger.LogError($"❌ CaptureSingleImage failed: {captureStatus}");
-                        context.Response.StatusCode = 500;
-                        context.Response.Close();
-                        return;
-                    }
-
-                    // گرفتن تصویر و تبدیل به template
-                    var imageStatus = scanner.GetCaptureImageBuffer(out Bitmap liveFingerprintBitmap, out int resolution);
-                    if (imageStatus != UFS_STATUS.OK)
-                    {
-                        _logger.LogError($"❌ گرفتن تصویر ناموفق بود: {imageStatus}");
-                        context.Response.StatusCode = 500;
-                        context.Response.Close();
-                        return;
-                    }
-
-                    // استخراج template از تصویر زنده
-                    byte[] liveTemplate = new byte[512];
-                    var extractStatus = scanner.Extract(liveTemplate, out int liveTemplateSize, out int liveQuality);
-                    if (extractStatus != UFS_STATUS.OK)
-                    {
-                        _logger.LogError($"❌ Extract برای اثر انگشت زنده شکست خورد: {extractStatus}");
-                        context.Response.StatusCode = 500;
-                        context.Response.Close();
-                        return;
-                    }
-
-                    // مقایسه با UFMatcher
-                    UFMatcher matcher = new UFMatcher();
-                    bool verifySuccess;
-                    var verifyStatus = matcher.Verify(
-                        incomingTemplate,
-                        incomingTemplate.Length,
-                        liveTemplate,
-                        liveTemplateSize,
-                        out verifySuccess
-                    );
-
-                    string result = (verifyStatus == UFM_STATUS.OK)
-                        ? "✅ اثر انگشت با نمونه ارسال شده مطابقت دارد."
-                        : "❌ اثر انگشت تطابق ندارد.";
-
-                    byte[] responseBytes = System.Text.Encoding.UTF8.GetBytes(result);
-                    context.Response.ContentType = "text/plain";
-                    context.Response.ContentLength64 = responseBytes.Length;
-                    context.Response.OutputStream.Write(responseBytes, 0, responseBytes.Length);
-                    context.Response.OutputStream.Close();
-
-                    _logger.LogInformation(result);
+                    byte[] actualTemplate = new byte[size];
+                    Array.Copy(buffer, actualTemplate, size);
+                    return actualTemplate;
                 }
+
+                return null;
             }
             catch (Exception ex)
             {
-                _logger.LogError($"❌ خطا در HandleMatchRequest: {ex.Message}");
-                context.Response.StatusCode = 500;
-                context.Response.Close();
+                Log("❌ خطا در استخراج Template: " + ex.Message);
+                return null;
             }
         }
 
-        private void InitializeScanner()
+        private string CreateResponse(bool success, object data, string message)
+        {
+            var obj = new
+            {
+                success = success,
+                data = data,
+                message = message
+            };
+
+            return JsonConvert.SerializeObject(obj);
+        }
+
+        private async Task SendResponse(HttpListenerResponse response, string json)
+        {
+            byte[] buffer = Encoding.UTF8.GetBytes(json);
+            response.ContentType = "application/json";
+            response.ContentEncoding = Encoding.UTF8;
+            response.StatusCode = (int)HttpStatusCode.OK;
+            await response.OutputStream.WriteAsync(buffer, 0, buffer.Length);
+            response.Close();
+        }
+        private string MatchTemplates(string requestBody)
         {
             try
             {
-                scannerManager = new UFScannerManager(null);
-                scannerManager.Init();
-                _logger.LogInformation("✅ اسکنر آماده شد.");
+                var matchRequest = JsonConvert.DeserializeObject<TemplateMatchRequest>(requestBody);
 
-                if (scannerManager.Scanners.Count > 0)
+                if (matchRequest.StoredTemplate == null || matchRequest.NewTemplate == null)
                 {
-                    scanner = scannerManager.Scanners[0];
-                    _logger.LogInformation("✅ اسکنر متصل شد.");
+                    return CreateResponse(false, null, "یکی از قالب‌ها خالی است.");
                 }
-                else
+
+                bool isMatched;
+                var status = matcher.Verify(
+                    matchRequest.StoredTemplate, matchRequest.StoredTemplate.Length,
+                    matchRequest.NewTemplate, matchRequest.NewTemplate.Length,
+                    out isMatched
+                );
+
+                if (status == UFM_STATUS.OK)
                 {
-                    _logger.LogError("⚠ هیچ اسکنری پیدا نشد.");
+                    return isMatched
+                        ? CreateResponse(true, "Templates matched.", "اثر انگشت‌ها تطابق دارند ✅")
+                        : CreateResponse(false, "Templates do not match.", "اثر انگشت‌ها تطابق ندارند ❌");
                 }
+
+                return CreateResponse(false, null, "خطا در تطبیق: " + status);
             }
             catch (Exception ex)
             {
-                _logger.LogError("❌ Error initializing scanner: " + ex.Message);
+                Log("❌ خطا در MatchTemplates: " + ex.Message);
+                return CreateResponse(false, null, "خطای سرور در پردازش قالب‌ها.");
             }
         }
 
-        public override void Dispose()
-        {
-            _listener?.Stop();
-            _listener?.Close();
-            base.Dispose();
-        }
 
-        private class MatchRequest
+        private void Log(string message)
         {
-            public string Base64Template { get; set; }
+            File.AppendAllText("log.txt", $"{DateTime.Now}: {message}{Environment.NewLine}");
+        }
+        public class TemplateMatchRequest
+        {
+            public byte[] StoredTemplate { get; set; }
+            public byte[] NewTemplate { get; set; }
         }
     }
 }
